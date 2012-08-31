@@ -934,40 +934,11 @@
   
   self.cacheHandlingBlock = nil;
   
-  @synchronized(self) {
-    self.isCancelled = YES;
-    
-    [self.connection cancel];
-    
-    [self.responseBlocks removeAllObjects];
-    self.responseBlocks = nil;
-    
-    [self.errorBlocks removeAllObjects];
-    self.errorBlocks = nil;
-    
-    [self.uploadProgressChangedHandlers removeAllObjects];
-    self.uploadProgressChangedHandlers = nil;
-    
-    [self.downloadProgressChangedHandlers removeAllObjects];
-    self.downloadProgressChangedHandlers = nil;
-    
-    for(NSOutputStream *stream in self.downloadStreams)
-      [stream close];
-    
-    [self.downloadStreams removeAllObjects];
-    self.downloadStreams = nil;
-    
-    self.authHandler = nil;    
-    self.mutableData = nil;
-    self.downloadedDataSize = 0;
-    
-    self.cacheHandlingBlock = nil;
-    
-    if(self.state == MKNetworkOperationStateExecuting)
-      self.state = MKNetworkOperationStateFinished; // This notifies the queue and removes the operation.
-    // if the operation is not removed, the spinner continues to spin, not a good UX
-    
-    [self endBackgroundTask];
+  if(self.state == MKNetworkOperationStateExecuting)
+    self.state = MKNetworkOperationStateFinished; // This notifies the queue and removes the operation.
+  // if the operation is not removed, the spinner continues to spin, not a good UX
+  
+  [self endBackgroundTask];
   }
   [super cancel];
 }
