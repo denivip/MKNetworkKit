@@ -25,6 +25,12 @@
 
 #import "MKNetworkKit.h"
 
+#ifdef DEBUG
+static const int ddLogLevel = LOG_LEVEL_VERBOSE;
+#else
+static const int ddLogLevel = LOG_LEVEL_ERROR;
+#endif
+
 #ifdef __OBJC_GC__
 #error MKNetworkKit does not support Objective-C Garbage Collection
 #endif
@@ -855,7 +861,9 @@
       
       [self.request setHTTPBody:[self bodyData]];
     }
-    
+      
+      DDLogVerbose(@"%@", self);
+      
     dispatch_async(dispatch_get_main_queue(), ^{
       self.connection = [[NSURLConnection alloc] initWithRequest:self.request 
                                                         delegate:self 
@@ -1136,7 +1144,7 @@
         NSString *bytesText = [rangeString substringWithRange:NSMakeRange(6, [rangeString length] - 7)];
         self.startPosition = [bytesText integerValue];
         self.downloadedDataSize = self.startPosition;
-        DLog(@"Resuming at %d bytes", self.startPosition);
+        DDLogVerbose(@"Resuming at %d bytes", self.startPosition);
       }
     }
     
@@ -1185,7 +1193,7 @@ totalBytesExpectedToWrite:(NSInteger)totalBytesExpectedToWrite {
   if (inRedirectResponse) {
     NSMutableURLRequest *r = [self.request mutableCopy];
     [r setURL: [inRequest URL]];
-    DLog(@"Redirected to %@", [[inRequest URL] absoluteString]);
+    DDLogVerbose(@"Redirected to %@", [[inRequest URL] absoluteString]);
     
     return r;
   } else {
@@ -1214,16 +1222,16 @@ totalBytesExpectedToWrite:(NSInteger)totalBytesExpectedToWrite {
   if (self.response.statusCode >= 300 && self.response.statusCode < 400) {
     
     if(self.response.statusCode == 301) {
-      DLog(@"%@ has moved to %@", self.url, [self.response.URL absoluteString]);
+      DDLogVerbose(@"%@ has moved to %@", self.url, [self.response.URL absoluteString]);
     }
     else if(self.response.statusCode == 304) {
-      DLog(@"%@ not modified", self.url);
+      DDLogVerbose(@"%@ not modified", self.url);
     }
     else if(self.response.statusCode == 307) {
-      DLog(@"%@ temporarily redirected", self.url);
+      DDLogVerbose(@"%@ temporarily redirected", self.url);
     }
     else {
-      DLog(@"%@ returned status %d", self.url, (int) self.response.statusCode);
+      DDLogVerbose(@"%@ returned status %d", self.url, (int) self.response.statusCode);
     }
     
   } else if (self.response.statusCode >= 400 && self.response.statusCode < 600 && ![self isCancelled]) {                        
@@ -1282,11 +1290,11 @@ totalBytesExpectedToWrite:(NSInteger)totalBytesExpectedToWrite {
       if([self responseData] == nil) return nil;
       NSError *error = nil;
       id returnValue = [NSClassFromString(@"NSJSONSerialization") JSONObjectWithData:[self responseData] options:0 error:&error];
-      if(error) DLog(@"JSON Parsing Error: %@", error);
+      if(error) DDLogVerbose(@"JSON Parsing Error: %@", error);
       return returnValue;
     }
     else {
-      DLog("You are running on iOS 4. Subclass MKNO and override responseJSON to support custom JSON parsing");
+      DDLogVerbose(@"You are running on iOS 4. Subclass MKNO and override responseJSON to support custom JSON parsing");
       return [self responseString];
     }
 }
@@ -1298,6 +1306,10 @@ totalBytesExpectedToWrite:(NSInteger)totalBytesExpectedToWrite {
   @synchronized(handlersMutexObject) {
     for(MKNKResponseBlock responseBlock in self.responseBlocks)
       responseBlock(self);
+      
+      // don't log for cached responses
+      if(![self isCachedResponse])
+          DDLogVerbose(@"%@", self);
   }
 }
 
@@ -1322,14 +1334,14 @@ totalBytesExpectedToWrite:(NSInteger)totalBytesExpectedToWrite {
 -(void) operationFailedWithError:(NSError*) error {
   
   self.error = error;
-  DLog(@"%@, [%@]", self, [self.error localizedDescription]);
+  DDLogVerbose(@"%@, [%@]", self, [self.error localizedDescription]);
   @synchronized(handlersMutexObject) {
     for(MKNKErrorBlock errorBlock in self.errorBlocks)
       errorBlock(error);
   }
   
 #if TARGET_OS_IPHONE
-  DLog(@"State: %d", [[UIApplication sharedApplication] applicationState]);
+  DDLogVerbose(@"State: %d", [[UIApplication sharedApplication] applicationState]);
   if([[UIApplication sharedApplication] applicationState] == UIApplicationStateBackground)
     [self showLocalNotification];
 #endif
