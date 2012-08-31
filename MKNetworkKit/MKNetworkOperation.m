@@ -33,7 +33,20 @@
 #error MKNetworkKit is ARC only. Either turn on ARC for the project or use -fobjc-arc flag
 #endif
 
-@interface MKNetworkOperation (/*Private Methods*/)
+@interface MKNetworkOperation (/*Private Methods*/) {
+    /*!
+     * Mutex object to lock handlers block.
+     * Handlers might be updated when the operation is executed by another thread.
+     * Followings are targets to be locked after initialization.
+     *
+     * self.responseBlocks
+     * self.errorBlocks
+     * self.uploadProgressChangedHandlers
+     * self.downloadProgressChangedHandlers
+     * self.downloadStreams
+     */
+    NSObject *handlersMutexObject;
+}
 @property (strong, nonatomic) NSURLConnection *connection;
 @property (strong, nonatomic) NSString *uniqueId;
 @property (strong, nonatomic) NSMutableURLRequest *request;
@@ -430,6 +443,7 @@
   MKNetworkOperation *theCopy = [[[self class] allocWithZone:zone] init];  // use designated initializer
   
   theCopy.postDataEncoding = _postDataEncoding;
+  theCopy->handlersMutexObject = [NSObject new];
   [theCopy setStringEncoding:self.stringEncoding];
   [theCopy setUniqueId:[self.uniqueId copy]];
   
@@ -465,13 +479,18 @@
   _connection = nil;
 }
 
--(void) updateHandlersFromOperation:(MKNetworkOperation*) operation {
-  
-  [self.responseBlocks addObjectsFromArray:operation.responseBlocks];
-  [self.errorBlocks addObjectsFromArray:operation.errorBlocks];
-  [self.uploadProgressChangedHandlers addObjectsFromArray:operation.uploadProgressChangedHandlers];
-  [self.downloadProgressChangedHandlers addObjectsFromArray:operation.downloadProgressChangedHandlers];
-  [self.downloadStreams addObjectsFromArray:operation.downloadStreams];
+-(BOOL) updateHandlersFromOperation:(MKNetworkOperation*) operation {
+  @synchronized(handlersMutexObject) {
+    if (self.state == MKNetworkOperationStateFinished || self.isCancelled) {
+      return NO;
+    }
+    [self.responseBlocks addObjectsFromArray:operation.responseBlocks];
+    [self.errorBlocks addObjectsFromArray:operation.errorBlocks];
+    [self.uploadProgressChangedHandlers addObjectsFromArray:operation.uploadProgressChangedHandlers];
+    [self.downloadProgressChangedHandlers addObjectsFromArray:operation.downloadProgressChangedHandlers];
+    [self.downloadStreams addObjectsFromArray:operation.downloadStreams];
+  }
+  return YES;
 }
 
 -(void) setCachedData:(NSData*) cachedData {
@@ -508,19 +527,22 @@
 }
 
 -(void) onCompletion:(MKNKResponseBlock) response onError:(MKNKErrorBlock) error {
-  
-  [self.responseBlocks addObject:[response copy]];
-  [self.errorBlocks addObject:[error copy]];
+  @synchronized(handlersMutexObject) {
+    [self.responseBlocks addObject:[response copy]];
+    [self.errorBlocks addObject:[error copy]];
+  }
 }
 
 -(void) onUploadProgressChanged:(MKNKProgressBlock) uploadProgressBlock {
-  
-  [self.uploadProgressChangedHandlers addObject:[uploadProgressBlock copy]];
+  @synchronized(handlersMutexObject) {
+    [self.uploadProgressChangedHandlers addObject:[uploadProgressBlock copy]];
+  }
 }
 
 -(void) onDownloadProgressChanged:(MKNKProgressBlock) downloadProgressBlock {
-  
-  [self.downloadProgressChangedHandlers addObject:[downloadProgressBlock copy]];
+  @synchronized(handlersMutexObject) {
+    [self.downloadProgressChangedHandlers addObject:[downloadProgressBlock copy]];
+  }
 }
 
 -(void) setUploadStream:(NSInputStream*) inputStream {
@@ -532,7 +554,9 @@
 -(void) addDownloadStream:(NSOutputStream*) outputStream {
   
   [outputStream scheduleInRunLoop:[NSRunLoop currentRunLoop] forMode:NSRunLoopCommonModes];
-  [self.downloadStreams addObject:outputStream];
+  @synchronized(handlersMutexObject) {
+    [self.downloadStreams addObject:outputStream];
+  }
 }
 
 - (id)initWithURLString:(NSString *)aURLString
@@ -541,7 +565,7 @@
 
 {	
   if((self = [super init])) {
-    
+    handlersMutexObject = [NSObject new];
     self.responseBlocks = [NSMutableArray array];
     self.errorBlocks = [NSMutableArray array];        
     
@@ -878,6 +902,37 @@
   
   if([self isFinished]) 
     return;
+
+  @synchronized(self) {
+  self.isCancelled = YES;
+
+  [self.connection cancel];
+  
+  @synchronized(handlersMutexObject) {
+    [self.responseBlocks removeAllObjects];
+    self.responseBlocks = nil;
+    
+    [self.errorBlocks removeAllObjects];
+    self.errorBlocks = nil;
+    
+    [self.uploadProgressChangedHandlers removeAllObjects];
+    self.uploadProgressChangedHandlers = nil;
+    
+    [self.downloadProgressChangedHandlers removeAllObjects];
+    self.downloadProgressChangedHandlers = nil;
+    
+    for(NSOutputStream *stream in self.downloadStreams)
+      [stream close];
+    
+    [self.downloadStreams removeAllObjects];
+    self.downloadStreams = nil;
+  }
+  
+  self.authHandler = nil;    
+  self.mutableData = nil;
+  self.downloadedDataSize = 0;
+  
+  self.cacheHandlingBlock = nil;
   
   @synchronized(self) {
     self.isCancelled = YES;
@@ -925,8 +980,10 @@
   self.state = MKNetworkOperationStateFinished;
   self.mutableData = nil;
   self.downloadedDataSize = 0;
-  for(NSOutputStream *stream in self.downloadStreams)
-    [stream close];
+  @synchronized(handlersMutexObject) {
+    for(NSOutputStream *stream in self.downloadStreams)
+      [stream close];
+  }
   
   [self operationFailedWithError:error];
   [self endBackgroundTask];
@@ -1022,20 +1079,24 @@
   self.response = (NSHTTPURLResponse*) response;
   
   // dont' save data if the operation was created to download directly to a stream.
-  if([self.downloadStreams count] == 0)
-    self.mutableData = [NSMutableData dataWithCapacity:size];
-  else
-    self.mutableData = nil;
-  
-  for(NSOutputStream *stream in self.downloadStreams)
-    [stream open];
+  NSUInteger downloadStreamsCount;
+  @synchronized(handlersMutexObject) {
+    downloadStreamsCount = [self.downloadStreams count];
+    if(downloadStreamsCount == 0)
+      self.mutableData = [NSMutableData dataWithCapacity:size];
+    else
+      self.mutableData = nil;
+    
+    for(NSOutputStream *stream in self.downloadStreams)
+      [stream open];
+  }
   
   NSDictionary *httpHeaders = [self.response allHeaderFields];
   
   // if you attach a stream to the operation, MKNetworkKit will not cache the response.
   // Streams are usually "big data chunks" that doesn't need caching anyways.
   
-  if([self.request.HTTPMethod isEqualToString:@"GET"] && [self.downloadStreams count] == 0) {
+  if([self.request.HTTPMethod isEqualToString:@"GET"] && downloadStreamsCount == 0) {
     
     // We have all this complicated cache handling since NSURLRequestReloadRevalidatingCacheData is not implemented
     // do cache processing only if the request is a "GET" method
@@ -1095,50 +1156,52 @@
 }
 
 - (void)connection:(NSURLConnection *)connection didReceiveData:(NSData *)data {
-  
-  if (self.downloadedDataSize == 0) {
-    // This is the first batch of data
-    // Check for a range header and make changes as neccesary
-    NSString *rangeString = [[self request] valueForHTTPHeaderField:@"Range"];
-    if ([rangeString hasPrefix:@"bytes="] && [rangeString hasSuffix:@"-"]) {
-      NSString *bytesText = [rangeString substringWithRange:NSMakeRange(6, [rangeString length] - 7)];
-      self.startPosition = [bytesText integerValue];
-      self.downloadedDataSize = self.startPosition;
-      DLog(@"Resuming at %d bytes", self.startPosition);
+  @synchronized(handlersMutexObject) {
+    if ([self.mutableData length] == 0 || [self.downloadStreams count] > 0) {
+      // This is the first batch of data
+      // Check for a range header and make changes as neccesary
+      NSString *rangeString = [[self request] valueForHTTPHeaderField:@"Range"];
+      if ([rangeString hasPrefix:@"bytes="] && [rangeString hasSuffix:@"-"]) {
+        NSString *bytesText = [rangeString substringWithRange:NSMakeRange(6, [rangeString length] - 7)];
+        self.startPosition = [bytesText integerValue];
+        self.downloadedDataSize = self.startPosition;
+        DLog(@"Resuming at %d bytes", self.startPosition);
+      }
     }
-  }
-  
-  if([self.downloadStreams count] == 0)
-    [self.mutableData appendData:data];
-  
-  for(NSOutputStream *stream in self.downloadStreams) {
     
-    if ([stream hasSpaceAvailable]) {
-      const uint8_t *dataBuffer = [data bytes];
-      [stream write:&dataBuffer[0] maxLength:[data length]];
-    }        
-  }
-  
-  self.downloadedDataSize += [data length];
-  
-  for(MKNKProgressBlock downloadProgressBlock in self.downloadProgressChangedHandlers) {
+    if([self.downloadStreams count] == 0)
+      [self.mutableData appendData:data];
     
-    if([self.response expectedContentLength] > 0) {
+    for(NSOutputStream *stream in self.downloadStreams) {
       
-      double progress = (double)(self.downloadedDataSize) / (double)(self.startPosition + [self.response expectedContentLength]);
-      downloadProgressBlock(progress);
-    }        
+      if ([stream hasSpaceAvailable]) {
+        const uint8_t *dataBuffer = [data bytes];
+        [stream write:&dataBuffer[0] maxLength:[data length]];
+      }        
+    }
+    
+    self.downloadedDataSize += [data length];
+    
+    for(MKNKProgressBlock downloadProgressBlock in self.downloadProgressChangedHandlers) {
+      
+      if([self.response expectedContentLength] > 0) {
+        
+        double progress = (double)(self.downloadedDataSize) / (double)(self.startPosition + [self.response expectedContentLength]);
+        downloadProgressBlock(progress);
+      }        
+    }
   }
 }
 
 - (void)connection:(NSURLConnection *)connection didSendBodyData:(NSInteger)bytesWritten 
  totalBytesWritten:(NSInteger)totalBytesWritten
 totalBytesExpectedToWrite:(NSInteger)totalBytesExpectedToWrite {
-  
-  for(MKNKProgressBlock uploadProgressBlock in self.uploadProgressChangedHandlers) {
-    
-    if(totalBytesExpectedToWrite > 0) {
-      uploadProgressBlock(((double)totalBytesWritten/(double)totalBytesExpectedToWrite));
+  @synchronized(handlersMutexObject) {
+    for(MKNKProgressBlock uploadProgressBlock in self.uploadProgressChangedHandlers) {
+      
+      if(totalBytesExpectedToWrite > 0) {
+        uploadProgressBlock(((double)totalBytesWritten/(double)totalBytesExpectedToWrite));
+      }
     }
   }
 }
@@ -1165,8 +1228,10 @@ totalBytesExpectedToWrite:(NSInteger)totalBytesExpectedToWrite {
   
   self.state = MKNetworkOperationStateFinished;    
   
-  for(NSOutputStream *stream in self.downloadStreams)
-    [stream close];
+  @synchronized(handlersMutexObject) {
+    for(NSOutputStream *stream in self.downloadStreams)
+      [stream close];
+  }
   
   if (self.response.statusCode >= 200 && self.response.statusCode < 300 && ![self isCancelled]) {
     
@@ -1259,9 +1324,10 @@ totalBytesExpectedToWrite:(NSInteger)totalBytesExpectedToWrite {
 #pragma mark Overridable methods
 
 -(void) operationSucceeded {
-  
-  for(MKNKResponseBlock responseBlock in self.responseBlocks)
-    responseBlock(self);
+  @synchronized(handlersMutexObject) {
+    for(MKNKResponseBlock responseBlock in self.responseBlocks)
+      responseBlock(self);
+  }
 }
 
 -(void) showLocalNotification {
@@ -1286,8 +1352,10 @@ totalBytesExpectedToWrite:(NSInteger)totalBytesExpectedToWrite {
   
   self.error = error;
   DLog(@"%@, [%@]", self, [self.error localizedDescription]);
-  for(MKNKErrorBlock errorBlock in self.errorBlocks)
-    errorBlock(error);  
+  @synchronized(handlersMutexObject) {
+    for(MKNKErrorBlock errorBlock in self.errorBlocks)
+      errorBlock(error);
+  }
   
 #if TARGET_OS_IPHONE
   DLog(@"State: %d", [[UIApplication sharedApplication] applicationState]);
